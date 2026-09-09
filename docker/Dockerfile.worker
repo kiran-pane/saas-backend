@@ -1,0 +1,24 @@
+FROM python:3.12-slim AS builder
+WORKDIR /app
+RUN pip install --no-cache-dir poetry==1.8.3
+COPY pyproject.toml ./
+RUN poetry config virtualenvs.create false \
+    && poetry export -f requirements.txt --output requirements.txt --without-hashes --without dev || \
+       pip freeze > requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.12-slim
+# libmagic1: MIME-sniffing (python-magic). ffmpeg: VOD transcoding
+# (worker-media) and live transcoding (streaming-worker) both use this
+# same worker image — ffmpeg is only actually invoked by the queues that
+# need it, but keeping one worker image simplifies the build matrix.
+RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m appuser
+COPY --from=builder /install /usr/local
+WORKDIR /app
+COPY . .
+RUN mkdir -p /var/app/storage-dev /var/app/media-import /var/app/live-hls /var/app/live-recordings \
+    && chown -R appuser:appuser /var/app
+USER appuser
+CMD ["celery", "-A", "app.worker_main.celery_app", "worker", "-Q", "audit,notifications,llm,llm_heavy", "--concurrency=8"]

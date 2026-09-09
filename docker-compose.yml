@@ -1,0 +1,214 @@
+version: "3.9"
+
+# All application services read secrets/config from a single .env file
+# (copied from .env.example) — nothing is hardcoded here. See .env.example
+# for the full list: DB credentials, APP_SECRET_KEY, OPENAI/ANTHROPIC keys,
+# GOOGLE_CLIENT_ID/SECRET, CORS_ORIGINS, etc.
+
+networks:
+  saas-network:
+    driver: bridge
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    ports: ["8000:8000"]
+    env_file: .env
+    networks: [saas-network]
+    volumes:
+      - "local-storage-dev:/var/app/storage-dev"   # only used when STORAGE_PROVIDER=local
+      - "live-hls-output:/var/app/live-hls:ro"      # api/v1/live_hls.py reads live segments from here
+      - "media-import:/var/app/media-import:ro"     # admin-populated source_type="local_disk" imports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-default:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: celery -A app.worker_main.celery_app worker -Q audit,notifications,llm --concurrency=10
+    env_file: .env
+    networks: [saas-network]
+    depends_on:
+      api:
+        condition: service_started   # ensures migrations (run by api's entrypoint) have applied
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-llm-heavy:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: celery -A app.worker_main.celery_app worker -Q llm_heavy --concurrency=4
+    env_file: .env
+    networks: [saas-network]
+    volumes: ["local-storage-dev:/var/app/storage-dev"]  # only used when STORAGE_PROVIDER=local
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- VOD transcode worker (ffmpeg) ----
+  # Separate queue/service from worker-llm-heavy: video transcoding is
+  # CPU-bound in a different way than LLM ingestion (long-running,
+  # multi-core, no external API calls) — isolating it means a burst of
+  # video uploads can't starve document ingestion or vice versa.
+  worker-media:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: celery -A app.worker_main.celery_app worker -Q media --concurrency=2
+    env_file: .env
+    networks: [saas-network]
+    volumes:
+      - "local-storage-dev:/var/app/storage-dev"
+      - "media-import:/var/app/media-import:ro"   # admin-populated source_type="local_disk" imports
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- Live-stream (CCTV/RTSP) supervisor ----
+  # A dedicated, long-lived process — NOT a Celery worker (see
+  # app/streaming_worker_main.py's module docstring for why). Normally
+  # runs as a single instance; scaling this horizontally would require
+  # partitioning which live sources each instance supervises, not simply
+  # adding replicas (they'd all try to supervise every source).
+  streaming-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.streaming
+    env_file: .env
+    networks: [saas-network]
+    volumes:
+      - "live-hls-output:/var/app/live-hls"
+      - "live-recordings:/var/app/live-recordings"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: celery -A app.worker_main.celery_app beat
+    env_file: .env
+    networks: [saas-network]
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:2.0
+    command: celery flower --broker=redis://redis:6379/1 --basic_auth=${FLOWER_BASIC_AUTH:-admin:change-me}
+    env_file: .env
+    ports: ["5555:5555"]
+    networks: [saas-network]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- Postgres: the single source of truth, pgvector-enabled ----
+  # Required for: multi-tenant schema, RBAC tables, audit log partitions,
+  # LangGraph checkpoints, and document embeddings (pgvector extension is
+  # baked into this image, enabled via the Alembic migration).
+  postgres:
+    image: pgvector/pgvector:pg16
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${DB_NAME:-saas_backend}
+      POSTGRES_USER: ${DB_USER:-saas_app}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]   # remove/comment out in production — access via pgbouncer only
+    networks: [saas-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-saas_app} -d ${DB_NAME:-saas_backend}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---- PgBouncer: transaction-mode pooling between the app and Postgres ----
+  # Lets many stateless api/worker replicas share a small number of real
+  # Postgres connections. The app connects here, never directly to
+  # `postgres`, in every environment above local one-off debugging.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DATABASE_URL: postgres://${DB_USER:-saas_app}:${DB_PASSWORD:-change-me}@postgres:5432/${DB_NAME:-saas_backend}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 25
+    ports: ["6432:6432"]
+    networks: [saas-network]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes: ["redisdata:/data"]
+    ports: ["6379:6379"]   # remove/comment out in production
+    networks: [saas-network]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---- ClamAV: virus scanning gate for uploaded documents ----
+  # app/storage/scanning.py connects to this over TCP (CLAMAV_HOST=clamav,
+  # CLAMAV_PORT=3310). The freshclam definitions database takes a few
+  # minutes to download on first start — scan_document_task's retry logic
+  # (max_retries=2) covers a cold-start container correctly rejecting
+  # scans until ready. Set CLAMAV_ENABLED=false in .env for local dev if
+  # you don't want to run this container at all (accepted trade-off:
+  # uploads skip virus scanning entirely — never do this in production).
+  clamav:
+    image: clamav/clamav:1.3
+    networks: [saas-network]
+    volumes: ["clamav-data:/var/lib/clamav"]
+    healthcheck:
+      test: ["CMD-SHELL", "clamdcheck.sh || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s   # first-run definitions download can take a while
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  clamav-data:
+  local-storage-dev:
+  live-hls-output:
+  live-recordings:
+  media-import:

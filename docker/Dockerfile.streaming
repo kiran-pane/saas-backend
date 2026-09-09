@@ -1,0 +1,28 @@
+# Dedicated image for the live-stream supervisor process
+# (app/streaming_worker_main.py). Separate from Dockerfile.worker even
+# though both need ffmpeg, because this process's failure/restart
+# semantics, resource profile (many long-lived ffmpeg children, not
+# short Celery task invocations), and scaling considerations
+# (one instance is normal; Celery workers scale horizontally, this
+# doesn't in the same way) are different enough to warrant a distinct
+# image and docker-compose service rather than overloading
+# Dockerfile.worker's role.
+FROM python:3.12-slim AS builder
+WORKDIR /app
+RUN pip install --no-cache-dir poetry==1.8.3
+COPY pyproject.toml ./
+RUN poetry config virtualenvs.create false \
+    && poetry export -f requirements.txt --output requirements.txt --without-hashes --without dev || \
+       pip freeze > requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m appuser
+COPY --from=builder /install /usr/local
+WORKDIR /app
+COPY . .
+RUN mkdir -p /var/app/live-hls /var/app/live-recordings && chown -R appuser:appuser /var/app
+USER appuser
+CMD ["python", "-m", "app.streaming_worker_main"]
