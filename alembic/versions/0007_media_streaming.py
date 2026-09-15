@@ -3,13 +3,13 @@ live_stream_sources (CCTV/RTSP). Both RLS-protected like every other
 tenant-scoped table.
 
 Revision ID: 0007_media_streaming
-Revises: 0006_subscription_provider_index
+Revises: 0006_subscription__index
 Create Date: 2026-01-07
 """
 from alembic import op
 
 revision = "0007_media_streaming"
-down_revision = "0006_subscription_provider_index"
+down_revision = "0006_subscription__index"
 branch_labels = None
 depends_on = None
 

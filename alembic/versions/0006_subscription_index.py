@@ -12,13 +12,13 @@ it's populated once, out-of-band of RLS, and used purely for tenant
 resolution before the session variable is set for the real (RLS-protected)
 read/write against `subscriptions`/`payments`.
 
-Revision ID: 0006_subscription_provider_index
+Revision ID: 0006_subscription__index
 Revises: 0005_payments
 Create Date: 2026-01-06
 """
 from alembic import op
 
-revision = "0006_subscription_provider_index"
+revision = "0006_subscription__index"
 down_revision = "0005_payments"
 branch_labels = None
 depends_on = None

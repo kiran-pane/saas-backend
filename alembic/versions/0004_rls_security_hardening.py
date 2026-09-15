@@ -10,13 +10,13 @@
    change needed for that part; included here as a single "security
    hardening" migration for traceability.
 
-Revision ID: 0004_rls_roles_and_security_hardening
+Revision ID: 0004_rls_security_hardening
 Revises: 0003_storage_layer
 Create Date: 2026-01-04
 """
 from alembic import op
 
-revision = "0004_rls_roles_and_security_hardening"
+revision = "0004_rls_security_hardening"
 down_revision = "0003_storage_layer"
 branch_labels = None
 depends_on = None

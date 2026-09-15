@@ -3,13 +3,13 @@ webhook-event dedup table. Amounts stored in integer cents to avoid
 floating-point rounding in billing math.
 
 Revision ID: 0005_payments
-Revises: 0004_rls_roles_and_security_hardening
+Revises: 0004_rls_security_hardening
 Create Date: 2026-01-05
 """
 from alembic import op
 
 revision = "0005_payments"
-down_revision = "0004_rls_roles_and_security_hardening"
+down_revision = "0004_rls_security_hardening"
 branch_labels = None
 depends_on = None
 
